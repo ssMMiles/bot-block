@@ -134,6 +134,9 @@ pub enum Error {
 
     #[error("Cloudflare API Error - {0}: {1}")]
     CloudflareApiError(u16, String),
+
+    #[error("JSON Error: {0}")]
+    JsonError(#[from] serde_json::Error),
 }
 
 pub struct ActivityScan {
@@ -282,144 +285,129 @@ impl BotBlock {
 
         rx.into_iter()
             .par_bridge()
-            .map(|result| {
+            .map(|result| -> Result<(), Error> {
                 let started_at = SystemTime::now();
 
-                // Handle the result of the task if needed
-                match result {
-                    Ok((start_timestamp, end_timestamp, bytes)) => {
-                        let data: QueryResult<UserActivityData> =
-                            match serde_json::from_slice(&bytes) {
-                                Ok(data) => data,
-                                Err(err) => {
-                                    log::error!("Error parsing user activity data: {}", err);
-                                }
-                            };
-                        let data_size_raw = bytes.len();
+                let (start_timestamp, end_timestamp, bytes) = result?;
+                let data: QueryResult<UserActivityData> = serde_json::from_slice(&bytes)?;
+                let data_size_raw = bytes.len();
 
-                        drop(bytes);
+                drop(bytes);
 
-                        let user_activity = data.data;
+                let user_activity = data.data;
 
-                        let mut data_by_user_id = user_list
-                            .iter()
-                            .map(|entry| {
-                                (
-                                    entry.user_id.clone(),
-                                    UserActivity::new(
-                                        start_timestamp,
-                                        end_timestamp,
-                                        scan.precision,
-                                    ),
-                                )
-                            })
-                            .collect::<std::collections::HashMap<String, UserActivity>>();
+                let mut data_by_user_id = user_list
+                    .iter()
+                    .map(|entry| {
+                        (
+                            entry.user_id.clone(),
+                            UserActivity::new(start_timestamp, end_timestamp, scan.precision),
+                        )
+                    })
+                    .collect::<std::collections::HashMap<String, UserActivity>>();
 
-                        for entry in &user_activity {
-                            if let Some(activity) = data_by_user_id.get(&entry.user_id) {
-                                activity.append_sample(&entry);
-                            }
-                        }
-
-                        for (user_id, activity) in data_by_user_id.drain() {
-                            if activity.time_active_ratio() == 0.0 {
-                                continue;
-                            }
-
-                            total_user_samples.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let active_ratio = activity.time_active_ratio();
-
-                            let (mean, variance) = activity.mean_and_variance();
-                            let dispersion_index = variance as f64 / mean as f64;
-
-                            let standard_deviation = variance.sqrt();
-
-                            total_active_ratio.fetch_add(
-                                (active_ratio * FLOAT_PRECISION_FACTOR as f64) as u64,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                            total_dispersion_index.fetch_add(
-                                (dispersion_index * FLOAT_PRECISION_FACTOR as f64) as u64,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-
-                            total_standard_deviation.fetch_add(
-                                (standard_deviation * FLOAT_PRECISION_FACTOR as f64) as u64,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-
-                            for check in &scan.checks {
-                                let user_id = user_id.clone();
-
-                                let is_over_active_threshold = active_ratio
-                                    >= check.active_ratio_threshold.unwrap_or(f64::MIN);
-                                let is_below_dispersion_threshold = dispersion_index
-                                    <= check.dispersion_index_threshold.unwrap_or(f64::MAX);
-
-                                if is_over_active_threshold & is_below_dispersion_threshold {
-                                    log::info!(
-                                    "User {} ({} - {}) - Active Ratio: {} - Dispersion Index: {}",
-                                    user_id,
-                                    start_timestamp,
-                                    end_timestamp,
-                                    active_ratio,
-                                    dispersion_index
-                                );
-
-                                    let message = format!(
-                                    "**User {}**\n**Activity Ratio**: {}\n**Dispersion Index**: {}",
-                                    user_id, active_ratio, dispersion_index
-                                );
-
-                                    let botblock = self.clone();
-                                    // tokio::spawn(async move {
-                                    //     botblock
-                                    //         .send_webhook(
-                                    //             &message,
-                                    //             Some(GrafanaRender {
-                                    //                 user_id: user_id.to_string(),
-                                    //                 start_timestamp,
-                                    //                 end_timestamp,
-                                    //             }),
-                                    //         )
-                                    //         .await
-                                    //         .unwrap()
-                                    // });
-                                }
-                            }
-                        }
-
-                        // let average_active_ratio = total_active_ratio
-                        //     .load(std::sync::atomic::Ordering::SeqCst)
-                        //     / total_user_samples.load(std::sync::atomic::Ordering::SeqCst);
-                        // let average_dispersion_index = total_dispersion_index
-                        //     .load(std::sync::atomic::Ordering::SeqCst)
-                        //     / total_user_samples.load(std::sync::atomic::Ordering::SeqCst);
-
-                        // log::debug!(
-                        //     "Average Active Ratio: {} - Average Dispersion Index: {}",
-                        //     average_active_ratio,
-                        //     average_dispersion_index
-                        // );
-
-                        let elapsed = SystemTime::now().duration_since(started_at).unwrap();
-                        total_scan_duration.fetch_add(
-                            elapsed.as_millis() as u64,
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-
-                        log::info!(
-                            "Scanned {:.2}MB Data Block in {}ms",
-                            data_size_raw as f64 / 1024.0 / 1024.0,
-                            elapsed.as_millis()
-                        );
-                    }
-                    Err(err) => {
-                        log::error!("Error fetching user activity: {}", err);
+                for entry in &user_activity {
+                    if let Some(activity) = data_by_user_id.get(&entry.user_id) {
+                        activity.append_sample(&entry);
                     }
                 }
+
+                for (user_id, activity) in data_by_user_id.drain() {
+                    if activity.time_active_ratio() == 0.0 {
+                        continue;
+                    }
+
+                    total_user_samples.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let active_ratio = activity.time_active_ratio();
+
+                    let (mean, variance) = activity.mean_and_variance();
+                    let dispersion_index = variance as f64 / mean as f64;
+
+                    let standard_deviation = variance.sqrt();
+
+                    total_active_ratio.fetch_add(
+                        (active_ratio * FLOAT_PRECISION_FACTOR as f64) as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    total_dispersion_index.fetch_add(
+                        (dispersion_index * FLOAT_PRECISION_FACTOR as f64) as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+
+                    total_standard_deviation.fetch_add(
+                        (standard_deviation * FLOAT_PRECISION_FACTOR as f64) as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+
+                    for check in &scan.checks {
+                        let user_id = user_id.clone();
+
+                        let is_over_active_threshold =
+                            active_ratio >= check.active_ratio_threshold.unwrap_or(f64::MIN);
+                        let is_below_dispersion_threshold = dispersion_index
+                            <= check.dispersion_index_threshold.unwrap_or(f64::MAX);
+
+                        if is_over_active_threshold & is_below_dispersion_threshold {
+                            log::info!(
+                                "User {} ({} - {}) - Active Ratio: {} - Dispersion Index: {}",
+                                user_id,
+                                start_timestamp,
+                                end_timestamp,
+                                active_ratio,
+                                dispersion_index
+                            );
+
+                            let message = format!(
+                                "**User {}**\n**Activity Ratio**: {}\n**Dispersion Index**: {}",
+                                user_id, active_ratio, dispersion_index
+                            );
+
+                            let botblock = self.clone();
+                            // tokio::spawn(async move {
+                            //     botblock
+                            //         .send_webhook(
+                            //             &message,
+                            //             Some(GrafanaRender {
+                            //                 user_id: user_id.to_string(),
+                            //                 start_timestamp,
+                            //                 end_timestamp,
+                            //             }),
+                            //         )
+                            //         .await
+                            //         .unwrap()
+                            // });
+                        }
+                    }
+                }
+
+                // let average_active_ratio = total_active_ratio
+                //     .load(std::sync::atomic::Ordering::SeqCst)
+                //     / total_user_samples.load(std::sync::atomic::Ordering::SeqCst);
+                // let average_dispersion_index = total_dispersion_index
+                //     .load(std::sync::atomic::Ordering::SeqCst)
+                //     / total_user_samples.load(std::sync::atomic::Ordering::SeqCst);
+
+                // log::debug!(
+                //     "Average Active Ratio: {} - Average Dispersion Index: {}",
+                //     average_active_ratio,
+                //     average_dispersion_index
+                // );
+
+                let elapsed = SystemTime::now().duration_since(started_at).unwrap();
+                total_scan_duration.fetch_add(
+                    elapsed.as_millis() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+
+                log::info!(
+                    "Scanned {:.2}MB Data Block in {}ms",
+                    data_size_raw as f64 / 1024.0 / 1024.0,
+                    elapsed.as_millis()
+                );
+
+                Ok(())
             })
-            .collect::<()>();
+            .collect::<Result<(), Error>>();
 
         let average_scan_duration =
             total_scan_duration.load(std::sync::atomic::Ordering::SeqCst) / scan.iterations;

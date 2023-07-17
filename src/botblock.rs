@@ -217,6 +217,8 @@ impl BotBlock {
             let mut fetch_tasks = FuturesUnordered::new();
 
             for _ in 0..cmp::min(scan.iterations as usize, scan.concurrency) {
+                log::info!("Fetching Data Block #{}", iteration);
+
                 let end_timestamp = last_start_timestamp;
                 let start_timestamp = end_timestamp - scan.period;
 

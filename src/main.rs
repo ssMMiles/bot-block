@@ -13,43 +13,55 @@ mod discord;
 #[tokio::main]
 async fn main() {
     env_logger::init_from_env(
-        env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "info"),
+        env_logger::Env::default().filter_or(env_logger::DEFAULT_FILTER_ENV, "h2=info,info"),
     );
 
-    log::info!("Initializing BotBlock client...");
+    log::info!("Initializing BotBlock");
 
     let started_at = std::time::Instant::now();
 
-    let client = BotBlock::new();
+    let client = match BotBlock::new().await {
+        Ok(client) => client,
+        Err(err) => {
+            log::error!("Failed to initialize BotBlock: {}", err);
+            return;
+        }
+    };
 
     let scans = vec![
-        // ActivityScan {
-        //     period: 60 * 60 * 24,
-        //     precision: 15,
-
-        //     iterations: 14,
-        //     concurrency: 4,
-
-        //     checks: vec![ActivityScanCheck {
-        //         active_ratio_threshold: 0.05,
-        //         dispersion_index_threshold: 2.0,
-        //     }],
-        // },
-        // ActivityScan {
-        //     period: 60 * 60,
-        //     precision: 1,
-
-        //     iterations: 24,
-        //     concurrency: 2,
-
-        //     checks: vec![ActivityScanCheck {
-        //         active_ratio_threshold: Some(0.002),
-        //         dispersion_index_threshold: Some(0.8),
-        //     }],
-        // },
         ActivityScan {
-            period: 60 * 60 * 12,
+            name: "Moderately Clustered Daily Activity".to_owned(),
+
+            period: 60 * 60 * 24,
+            precision: 15,
+
+            iterations: 2,
+            concurrency: 4,
+
+            checks: vec![ActivityScanCheck {
+                active_ratio_threshold: Some(0.05),
+                dispersion_index_threshold: Some(2.0),
+            }],
+        },
+        ActivityScan {
+            name: "High Precision & Highly Clustered Hourly Activity".to_owned(),
+
+            period: 60 * 60,
             precision: 1,
+
+            iterations: 72,
+            concurrency: 2,
+
+            checks: vec![ActivityScanCheck {
+                active_ratio_threshold: Some(0.002),
+                dispersion_index_threshold: Some(0.8),
+            }],
+        },
+        ActivityScan {
+            name: "Bi-Daily High Activity".to_owned(),
+
+            period: 60 * 60 * 12,
+            precision: 5,
 
             iterations: 100,
             concurrency: 8,
@@ -62,11 +74,24 @@ async fn main() {
     ];
 
     for scan in scans {
-        client.scan_recent_player_activity(scan).await.unwrap();
+        let scan_started_at = std::time::Instant::now();
+        let name = scan.name.clone();
+
+        log::info!("Scan Starting: {}", name);
+
+        if let Err(err) = client.scan_recent_player_activity(scan).await {
+            log::error!("Scan Failed: {}", err);
+            continue;
+        }
+
+        log::info!(
+            "Scan Complete ({:.2}s)",
+            scan_started_at.elapsed().as_secs_f64()
+        );
     }
 
     log::info!(
-        "Finished BotBlock scans in {} seconds",
+        "All Scans Complete ({:.2}s)",
         started_at.elapsed().as_secs_f64()
     );
 }

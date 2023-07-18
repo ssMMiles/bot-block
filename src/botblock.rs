@@ -4,118 +4,15 @@ use rayon::prelude::{ParallelBridge, ParallelIterator};
 use reqwest::Response;
 use serde::Deserialize;
 use std::{
-    cmp, env,
+    cmp,
+    collections::HashSet,
+    env,
     process::exit,
     sync::{atomic::AtomicU64, Arc},
     time::SystemTime,
 };
 
-use crate::discord::GrafanaRender;
-
-const BANNED_USERS: &[&str] = &[
-    "304732833543487499",
-    "475016236388843522",
-    "854500395345641482",
-    "1062408462220414997",
-    "1102980635359981608", // selfbot
-    "930827724942110730",  // bot dev
-    "228096171497750528",  // new selfbot duo
-    "424382316790546435",
-    "944364342965583883", // selfbot 05/18, small server entirely wiped
-    // 2 long running selfbots growing evry 10m, private serve
-    "1039617200031531101",
-    "359457963955453967",
-    "430172752700375053",
-    "344199622694273069",
-    "1061687333625282620",
-    "257353688165777408",
-    "1041512947882655876",
-    "892288625541251093",
-    "259389655345135617",
-    "180522503175667721",
-    "542242219218698241",
-    "547585330946244628",
-    "398755862354853891",
-    "1061336710455251027", // selfbot
-    "215255612035039242",  // selfbot
-    // week old selfbot pair,
-    "1106809740522168443",
-    "1106811554231500820",
-    // knowing accomplices
-    "790780144406757476",
-    "802351698026692668",
-    "288093658480115712",
-    "794042220566675456",
-    "1026944710650105896",
-    "338847512255528960",
-    "327652181107015682",
-    "475837799216447500",
-    // triple selfbot
-    "1089501432606109726",
-    "1089517983409393825",
-    "1086770907722289213",
-    // double selfbot
-    "1110648273057894430",
-    ////////////////////////,
-    "589337371162443796",
-    "145994177279295488",
-    "724442177303740418",
-    "574914455226286100",
-    "880138615575949323",
-    "1083680741122125925",
-    "577012636902883339",
-    "1120583959957491832",
-    "984149444180213840",
-    "706562774029041764",
-    // probably knowing accomplices of large group
-    "988433294498607115",
-    "1042050814283366450",
-    "785792156270460929",
-    "428359446884909064",
-    "949705195074494545",
-    // one massive spammer
-    "280898491260207107",
-    // solo spambot but with only one other waterer in server
-    "1118063893592408094",
-    "472109093146984469",
-    "444281705809838080",
-    // sneaky fucker
-    "874765316880744580",
-    // WOOOO BOT BLOCK
-    "972420711413063730",
-    "280575018004381697",
-    "1028192672533458985",
-    "1008475788917612595",
-    // NEW
-    "721336100060266518",
-    "551422711105323018",
-    "484082692191682583",
-    "1070765449471594506",
-    "1042642642904829992",
-    "417503711401607170",
-    "484082692191682583",
-    "1115590045349445652",
-    "1098826595894050847",
-    "895416800890716193",
-    "259928907912839168",
-    "517468040695382023",
-    "1071495617873989725",
-    "1077353683882352746",
-    "1103066873395941456",
-    "1009239788387319919",
-    "1032796039989690380",
-    // lol
-    "752100724359430195",
-    "550811934677663755",
-    "406226514934366259",
-    "445956808725757962",
-    "688146006692593706",
-    "367333221811355648",
-    "1031579351956860959",
-    "259029103716466688",
-    "221310372714512384",
-    "878179196290088991",
-];
+use crate::discord::{DiscordWebhookMessage, GrafanaRender};
 
 fn read_envvar(key: &str) -> String {
     match env::var(key) {
@@ -135,11 +32,16 @@ pub enum Error {
     #[error("Cloudflare API Error - {0}: {1}")]
     CloudflareApiError(u16, String),
 
+    #[error("BotBlock API Error - {0}: {1}")]
+    BotBlockApiError(u16, String),
+
     #[error("JSON Error: {0}")]
     JsonError(#[from] serde_json::Error),
 }
 
 pub struct ActivityScan {
+    pub name: String,
+
     pub period: u64,
     pub precision: u64,
     pub iterations: u64,
@@ -153,6 +55,12 @@ pub struct ActivityScanCheck {
     pub dispersion_index_threshold: Option<f64>,
 }
 
+#[allow(non_snake_case)]
+#[derive(Deserialize)]
+pub struct BotBlockBan {
+    pub UserId: String,
+}
+
 #[derive(Clone)]
 pub struct BotBlock {
     cloudflare_uri: String,
@@ -164,10 +72,13 @@ pub struct BotBlock {
     pub discord_webhook_url: String,
 
     pub http_client: reqwest::Client,
+    pub discord_webhook_queue: crossbeam::channel::Sender<DiscordWebhookMessage>,
+
+    pub ban_list: HashSet<String>,
 }
 
 impl BotBlock {
-    pub fn new() -> Self {
+    pub async fn new() -> Result<Self, Error> {
         let cloudflare_account = read_envvar("CLOUDFLARE_ACCOUNT_ID");
         let cloudflare_api_token = format!("Bearer {}", read_envvar("CLOUDFLARE_API_TOKEN"));
 
@@ -181,9 +92,32 @@ impl BotBlock {
 
         let discord_webhook_url = read_envvar("DISCORD_WEBHOOK_URL");
 
+        let botblock_api_token = read_envvar("BOTBLOCK_API_TOKEN");
+
         let http_client = reqwest::Client::new();
 
-        BotBlock {
+        let ban_list_response = http_client
+            .get("https://botblock.limbolabs.gg/api/bans")
+            .header("Authorization", botblock_api_token)
+            .send()
+            .await?;
+
+        if !ban_list_response.status().is_success() {
+            let status = ban_list_response.status().as_u16();
+            let body = ban_list_response.text().await?;
+
+            return Err(Error::BotBlockApiError(status, body));
+        }
+
+        let ban_list = ban_list_response
+            .json::<Vec<BotBlockBan>>()
+            .await?
+            .into_iter()
+            .map(|ban| ban.UserId)
+            .collect::<HashSet<String>>();
+
+        let (tx, rx) = crossbeam::channel::unbounded::<DiscordWebhookMessage>();
+        let botblock = BotBlock {
             cloudflare_uri,
             cloudflare_api_token,
 
@@ -193,7 +127,43 @@ impl BotBlock {
             discord_webhook_url,
 
             http_client,
-        }
+            discord_webhook_queue: tx,
+
+            ban_list,
+        };
+
+        let botblock_clone = botblock.clone();
+        tokio::task::spawn(async move {
+            let mut last_webhook_sent_at = SystemTime::now();
+
+            loop {
+                let botblock = botblock_clone.clone();
+
+                let message = match rx.recv() {
+                    Ok(message) => message,
+                    Err(_) => break,
+                };
+
+                let elapsed = SystemTime::now()
+                    .duration_since(last_webhook_sent_at)
+                    .unwrap()
+                    .as_millis() as u64;
+
+                if elapsed < 1000 {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1000 - elapsed)).await;
+                }
+
+                last_webhook_sent_at = SystemTime::now();
+
+                if let Err(error) = botblock.send_webhook(message).await {
+                    log::error!("Discord Webhook Error: {}", error);
+                }
+            }
+
+            log::warn!("Discord Webhook Sender Task Exited");
+        });
+
+        Ok(botblock)
     }
 
     pub async fn scan_recent_player_activity(&self, scan: ActivityScan) -> Result<(), Error> {
@@ -203,7 +173,7 @@ impl BotBlock {
             .as_secs();
 
         let mut user_list = self.fetch_user_list(0, current_timestamp).await?;
-        user_list.retain(|entry| !BANNED_USERS.contains(&entry.user_id.as_str()));
+        user_list.retain(|entry| !self.ban_list.contains(&entry.user_id));
 
         let mut last_start_timestamp = current_timestamp;
 
@@ -217,7 +187,7 @@ impl BotBlock {
             let mut fetch_tasks = FuturesUnordered::new();
 
             for _ in 0..cmp::min(scan.iterations as usize, scan.concurrency) {
-                log::info!("Fetching Data Block #{}", iteration);
+                log::debug!("Fetching Data Block #{}", iteration);
 
                 let end_timestamp = last_start_timestamp;
                 let start_timestamp = end_timestamp - scan.period;
@@ -244,7 +214,7 @@ impl BotBlock {
                     break;
                 }
 
-                log::info!("Fetching Data Block #{}", iteration);
+                log::debug!("Fetching Data Block #{}", iteration);
 
                 let end_timestamp = last_start_timestamp;
                 let start_timestamp = end_timestamp - scan.period;
@@ -261,7 +231,7 @@ impl BotBlock {
                         .fetch_user_activity_raw(start_timestamp, end_timestamp, scan.precision)
                         .await;
 
-                    log::info!(
+                    log::debug!(
                         "Fetched Data Block #{} in {}ms",
                         iteration,
                         started_at.elapsed().unwrap().as_millis()
@@ -328,16 +298,19 @@ impl BotBlock {
                     let standard_deviation = variance.sqrt();
 
                     total_active_ratio.fetch_add(
-                        (active_ratio * FLOAT_PRECISION_FACTOR as f64) as u64,
+                        (active_ratio * FLOAT_PRECISION_FACTOR as f64) as u64
+                            / FLOAT_PRECISION_FACTOR,
                         std::sync::atomic::Ordering::Relaxed,
                     );
                     total_dispersion_index.fetch_add(
-                        (dispersion_index * FLOAT_PRECISION_FACTOR as f64) as u64,
+                        (dispersion_index * FLOAT_PRECISION_FACTOR as f64) as u64
+                            / FLOAT_PRECISION_FACTOR,
                         std::sync::atomic::Ordering::Relaxed,
                     );
 
                     total_standard_deviation.fetch_add(
-                        (standard_deviation * FLOAT_PRECISION_FACTOR as f64) as u64,
+                        (standard_deviation * FLOAT_PRECISION_FACTOR as f64) as u64
+                            / FLOAT_PRECISION_FACTOR,
                         std::sync::atomic::Ordering::Relaxed,
                     );
 
@@ -350,11 +323,12 @@ impl BotBlock {
                             <= check.dispersion_index_threshold.unwrap_or(f64::MAX);
 
                         if is_over_active_threshold & is_below_dispersion_threshold {
+                            let grafana_url = format!("https://limbolabs.grafana.net/d/RL9sMaS4z/cloudflare-analytics?orgId=1&from={}000&to={}000&var-targetUser={}&viewPanel=5",
+                                start_timestamp, end_timestamp, user_id);
                             log::info!(
-                                "User {} ({} - {}) - Active Ratio: {} - Dispersion Index: {}",
+                                "User {} ({}) - Active Ratio: {} - Dispersion Index: {}",
                                 user_id,
-                                start_timestamp,
-                                end_timestamp,
+                                hyperlink(&grafana_url, "View In Grafana"),
                                 active_ratio,
                                 dispersion_index
                             );
@@ -364,20 +338,14 @@ impl BotBlock {
                                 user_id, active_ratio, dispersion_index
                             );
 
-                            let botblock = self.clone();
-                            // tokio::spawn(async move {
-                            //     botblock
-                            //         .send_webhook(
-                            //             &message,
-                            //             Some(GrafanaRender {
-                            //                 user_id: user_id.to_string(),
-                            //                 start_timestamp,
-                            //                 end_timestamp,
-                            //             }),
-                            //         )
-                            //         .await
-                            //         .unwrap()
-                            // });
+                            self.discord_webhook_queue.send(DiscordWebhookMessage {
+                                content: message,
+                                graph: Some(GrafanaRender {
+                                    user_id: user_id.to_string(),
+                                    start_timestamp,
+                                    end_timestamp,
+                                })
+                            }).unwrap();
                         }
                     }
                 }
@@ -401,7 +369,7 @@ impl BotBlock {
                     std::sync::atomic::Ordering::Relaxed,
                 );
 
-                log::info!(
+                log::debug!(
                     "Scanned {:.2}MB Data Block in {}ms",
                     data_size_raw as f64 / 1024.0 / 1024.0,
                     elapsed.as_millis()
@@ -409,7 +377,7 @@ impl BotBlock {
 
                 Ok(())
             })
-            .collect::<Result<(), Error>>();
+            .collect::<Result<(), Error>>()?;
 
         let average_scan_duration =
             total_scan_duration.load(std::sync::atomic::Ordering::SeqCst) / scan.iterations;
@@ -424,7 +392,7 @@ impl BotBlock {
         let average_standard_deviation =
             total_standard_deviation.load(std::sync::atomic::Ordering::SeqCst) / user_sample_count;
 
-        log::info!(
+        log::debug!(
             "Scanned total of {} seconds, {}x {}s blocks with {} second precision. Average block processing duration: {}ms",
             scan.period * scan.iterations,
             scan.iterations,
@@ -433,7 +401,7 @@ impl BotBlock {
             average_scan_duration
         );
 
-        log::info!(
+        log::debug!(
             "Average Active Ratio: {} - Average Dispersion Index: {} - Average Standard Deviation: {}",
             average_active_ratio,
             average_dispersion_index,
@@ -604,4 +572,8 @@ impl UserActivity {
 
         (mean, variance)
     }
+}
+
+fn hyperlink(url: &str, text: &str) -> String {
+    format!("\x1B]8;;{}\x1B\\{}\x1B]8;;\x1B\\", url, text)
 }

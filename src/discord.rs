@@ -12,6 +12,11 @@ pub struct GrafanaRender {
     pub end_timestamp: u64,
 }
 
+pub struct DiscordWebhookMessage {
+    pub content: String,
+    pub graph: Option<GrafanaRender>,
+}
+
 impl BotBlock {
     fn get_grafana_uri(&self, details: GrafanaRender) -> String {
         format!(
@@ -20,13 +25,9 @@ impl BotBlock {
         )
     }
 
-    pub async fn send_webhook(
-        &self,
-        message: &str,
-        render_details: Option<GrafanaRender>,
-    ) -> Result<(), reqwest::Error> {
+    pub async fn send_webhook(&self, message: DiscordWebhookMessage) -> Result<(), reqwest::Error> {
         let response: Response;
-        if let Some(details) = render_details {
+        if let Some(details) = message.graph {
             let image = self
                 .http_client
                 .get(self.get_grafana_uri(details))
@@ -40,7 +41,7 @@ impl BotBlock {
                 "embeds": [
                     {
                         "title": "BotBlock Detection",
-                        "description": message,
+                        "description": message.content,
                         "image": {
                             "url": "attachment://graph.png"
                         }
@@ -71,7 +72,7 @@ impl BotBlock {
                 "embeds": [
                     {
                         "title": "BotBlock Detection",
-                        "description": message,
+                        "description": message.content,
                     }
                 ]
             });

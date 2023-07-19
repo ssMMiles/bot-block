@@ -116,6 +116,8 @@ impl BotBlock {
             .map(|ban| ban.UserId)
             .collect::<HashSet<String>>();
 
+        log::debug!("Found {} Users In Existing Ban List", ban_list.len());
+
         let (tx, rx) = crossbeam::channel::unbounded::<DiscordWebhookMessage>();
         let botblock = BotBlock {
             cloudflare_uri,
@@ -412,7 +414,7 @@ impl BotBlock {
     }
 
     async fn query(&self, query: String) -> Result<Response, Error> {
-        log::debug!("Querying Cloudflare API: {}", query);
+        // log::debug!("Querying Cloudflare API: {}", query);
 
         let response = self
             .http_client

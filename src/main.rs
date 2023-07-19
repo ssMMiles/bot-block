@@ -49,8 +49,8 @@ async fn main() {
             period: 60 * 60,
             precision: 1,
 
-            iterations: 72,
-            concurrency: 2,
+            iterations: 24,
+            concurrency: 4,
 
             checks: vec![ActivityScanCheck {
                 active_ratio_threshold: Some(0.002),
@@ -63,8 +63,8 @@ async fn main() {
             period: 60 * 60 * 12,
             precision: 5,
 
-            iterations: 100,
-            concurrency: 8,
+            iterations: 7,
+            concurrency: 4,
 
             checks: vec![ActivityScanCheck {
                 active_ratio_threshold: Some(0.5),

@@ -55,10 +55,9 @@ pub struct ActivityScanCheck {
     pub dispersion_index_threshold: Option<f64>,
 }
 
-#[allow(non_snake_case)]
 #[derive(Deserialize)]
 pub struct BotBlockBan {
-    pub UserId: String,
+    pub user_id: String,
 }
 
 #[derive(Clone)]
@@ -113,7 +112,7 @@ impl BotBlock {
             .json::<Vec<BotBlockBan>>()
             .await?
             .into_iter()
-            .map(|ban| ban.UserId)
+            .map(|ban| ban.user_id)
             .collect::<HashSet<String>>();
 
         log::debug!("Found {} Users In Existing Ban List", ban_list.len());

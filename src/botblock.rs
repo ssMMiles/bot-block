@@ -7,22 +7,11 @@ use std::{
     cmp,
     collections::{HashMap, HashSet},
     env,
-    process::exit,
     sync::{atomic::AtomicU64, Arc},
     time::SystemTime,
 };
 
 use crate::discord::{send_discord_webhook, DiscordWebhookMessage, GrafanaRender};
-
-fn read_envvar(key: &str) -> String {
-    match env::var(key) {
-        Ok(value) => value,
-        _ => {
-            eprintln!("Please set the {} environment variable correctly.", key);
-            exit(1);
-        }
-    }
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -37,6 +26,12 @@ pub enum Error {
 
     #[error("JSON Error: {0}")]
     JsonError(#[from] serde_json::Error),
+
+    #[error("Failed to read config file: {0}")]
+    ConfigFileError(#[from] std::io::Error),
+
+    #[error("Failed to parse config file: {0}")]
+    ConfigParseError(#[from] toml::de::Error),
 }
 
 pub struct ActivityScan {
@@ -67,7 +62,7 @@ pub struct BotBlockInner {
     pub grafana_uri_base: String,
     pub grafana_api_token: String,
 
-    pub discord_webhook_url: String,
+    pub discord_webhook_uri: String,
 
     pub http_client: reqwest::Client,
     pub discord_webhook_queue: crossbeam::channel::Sender<DiscordWebhookMessage>,
@@ -80,22 +75,24 @@ pub struct BotBlock {
     pub _inner: Arc<BotBlockInner>,
 }
 
+#[derive(Deserialize)]
+pub struct BotBlockConfig {
+    pub cloudflare_account_id: String,
+    pub cloudflare_api_token: String,
+
+    pub grafana_uri_base: String,
+    pub grafana_api_token: String,
+
+    pub discord_webhook_uri: String,
+
+    pub botblock_api_token: String,
+}
+
 impl BotBlock {
     pub async fn new() -> Result<Self, Error> {
-        let cloudflare_account = read_envvar("CLOUDFLARE_ACCOUNT_ID");
-        let cloudflare_api_token = format!("Bearer {}", read_envvar("CLOUDFLARE_API_TOKEN"));
-
-        let cloudflare_uri = format!(
-            "https://api.cloudflare.com/client/v4/accounts/{userId}/analytics_engine/sql",
-            userId = cloudflare_account
-        );
-
-        let grafana_uri_base = read_envvar("GRAFANA_URI_BASE");
-        let grafana_api_token = format!("Bearer {}", read_envvar("GRAFANA_API_TOKEN"));
-
-        let discord_webhook_url = read_envvar("DISCORD_WEBHOOK_URL");
-
-        let botblock_api_token = read_envvar("BOTBLOCK_API_TOKEN");
+        let config: BotBlockConfig = toml::from_str(&std::fs::read_to_string(
+            env::var("BOTBLOCK_CONFIG").unwrap_or_else(|_| "botblock.toml".to_string()),
+        )?)?;
 
         let http_client = reqwest::ClientBuilder::new()
             .user_agent("BotBlock/1.0")
@@ -105,7 +102,7 @@ impl BotBlock {
 
         let ban_list_response = http_client
             .get("https://botblock.limbolabs.gg/api/bans")
-            .header("Authorization", botblock_api_token)
+            .header("Authorization", config.botblock_api_token)
             .send()
             .await?;
 
@@ -128,13 +125,16 @@ impl BotBlock {
         let (tx, rx) = crossbeam::channel::unbounded::<DiscordWebhookMessage>();
         let botblock = BotBlock {
             _inner: Arc::new(BotBlockInner {
-                cloudflare_uri,
-                cloudflare_api_token,
+                cloudflare_uri: format!(
+                    "https://api.cloudflare.com/client/v4/accounts/{}/analytics_engine/sql",
+                    config.cloudflare_account_id
+                ),
+                cloudflare_api_token: config.cloudflare_api_token,
 
-                grafana_uri_base: grafana_uri_base.clone(),
-                grafana_api_token: grafana_api_token.clone(),
+                grafana_uri_base: config.grafana_uri_base.clone(),
+                grafana_api_token: config.grafana_api_token.clone(),
 
-                discord_webhook_url: discord_webhook_url.clone(),
+                discord_webhook_uri: config.discord_webhook_uri.clone(),
 
                 http_client,
                 discord_webhook_queue: tx,
@@ -166,9 +166,9 @@ impl BotBlock {
 
                 if let Err(error) = send_discord_webhook(
                     http_client.clone(),
-                    &grafana_uri_base,
-                    &grafana_api_token,
-                    &discord_webhook_url,
+                    &config.grafana_uri_base,
+                    &config.grafana_api_token,
+                    &config.discord_webhook_uri,
                     message,
                 )
                 .await

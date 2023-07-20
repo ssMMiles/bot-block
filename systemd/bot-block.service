@@ -1,0 +1,10 @@
+[Unit]
+Description=Runs a BotBlock scan against recent user activity.
+Wants=bot-block.timer
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/bot-block
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=Runs a BotBlock scan against recent user activity.
+Requires=bot-block.service
+
+[Timer]
+Unit=myMonitor.service
+OnCalendar=*-*-* *:00:00
+
+[Install]
+WantedBy=timers.target

@@ -35,8 +35,8 @@ async fn main() {
             period: 60 * 60 * 24,
             precision: 15,
 
-            iterations: 2,
-            concurrency: 4,
+            iterations: 32,
+            concurrency: 8,
 
             checks: vec![ActivityScanCheck {
                 active_ratio_threshold: Some(0.05),
@@ -61,13 +61,27 @@ async fn main() {
             name: "Bi-Daily High Activity".to_owned(),
 
             period: 60 * 60 * 12,
-            precision: 5,
+            precision: 60 * 3,
 
-            iterations: 7,
-            concurrency: 4,
+            iterations: 8,
+            concurrency: 8,
 
             checks: vec![ActivityScanCheck {
-                active_ratio_threshold: Some(0.5),
+                active_ratio_threshold: Some(0.8),
+                dispersion_index_threshold: None,
+            }],
+        },
+        ActivityScan {
+            name: "Daily High Activity".to_owned(),
+
+            period: 60 * 60 * 24,
+            precision: 60 * 30,
+
+            iterations: 8,
+            concurrency: 8,
+
+            checks: vec![ActivityScanCheck {
+                active_ratio_threshold: Some(0.9),
                 dispersion_index_threshold: None,
             }],
         },

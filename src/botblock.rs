@@ -423,7 +423,10 @@ impl BotBlock {
             .http_client
             .post(&self._inner.cloudflare_uri)
             .body(query)
-            .header("Authorization", &self._inner.cloudflare_api_token)
+            .header(
+                "Authorization",
+                format!("Bearer {}", &self._inner.cloudflare_api_token),
+            )
             .send()
             .await?;
 

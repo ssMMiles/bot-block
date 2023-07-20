@@ -2,7 +2,7 @@
 set -e
 
 cargo build --release
-sudo cp target/release/bot-block /usr/local/bin
+sudo cp target/release/bot-block /usr/bin/bot-block
 
 sudo cp systemd/bot-block.service /etc/systemd/system/bot-block.service
 sudo cp systemd/bot-block.timer /etc/systemd/system/bot-block.timer

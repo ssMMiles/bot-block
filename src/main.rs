@@ -35,7 +35,7 @@ async fn main() {
             period: 60 * 60 * 24,
             precision: 15,
 
-            iterations: 8,
+            iterations: 1,
             concurrency: 4,
 
             checks: vec![ActivityScanCheck {
@@ -49,7 +49,7 @@ async fn main() {
             period: 60 * 60,
             precision: 1,
 
-            iterations: 24,
+            iterations: 1,
             concurrency: 4,
 
             checks: vec![ActivityScanCheck {
@@ -63,7 +63,7 @@ async fn main() {
             period: 60 * 60 * 12,
             precision: 60 * 3,
 
-            iterations: 8,
+            iterations: 1,
             concurrency: 4,
 
             checks: vec![ActivityScanCheck {
@@ -75,9 +75,9 @@ async fn main() {
             name: "Daily High Activity".to_owned(),
 
             period: 60 * 60 * 24,
-            precision: 60 * 30,
+            precision: 60 * 20,
 
-            iterations: 8,
+            iterations: 1,
             concurrency: 4,
 
             checks: vec![ActivityScanCheck {

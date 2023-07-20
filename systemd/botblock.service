@@ -1,11 +1,11 @@
 [Unit]
 Description=Runs a BotBlock scan against recent user activity.
-Wants=bot-block.timer
+Wants=botblock.timer
 
 [Service]
 Type=oneshot
 Environment=BOTBLOCK_CONFIG=/home/miles/bot-block/botblock.toml
-ExecStart=/usr/bin/bot-block
+ExecStart=/usr/bin/botblock
 
 [Install]
 WantedBy=multi-user.target

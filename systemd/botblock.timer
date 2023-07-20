@@ -1,6 +1,6 @@
 [Unit]
 Description=Runs a BotBlock scan against recent user activity.
-Requires=bot-block.service
+Requires=botblock.service
 
 [Timer]
 Unit=myMonitor.service

@@ -5,7 +5,7 @@ use reqwest::Response;
 use serde::Deserialize;
 use std::{
     cmp,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env,
     process::exit,
     sync::{atomic::AtomicU64, Arc},
@@ -93,7 +93,11 @@ impl BotBlock {
 
         let botblock_api_token = read_envvar("BOTBLOCK_API_TOKEN");
 
-        let http_client = reqwest::Client::new();
+        let http_client = reqwest::ClientBuilder::new()
+            .user_agent("BotBlock/1.0")
+            .http1_only()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()?;
 
         let ban_list_response = http_client
             .get("https://botblock.limbolabs.gg/api/bans")
@@ -173,8 +177,8 @@ impl BotBlock {
             .unwrap()
             .as_secs();
 
-        let mut user_list = self.fetch_user_list(0, current_timestamp).await?;
-        user_list.retain(|entry| !self.ban_list.contains(&entry.user_id));
+        // let mut user_list = self.fetch_user_list(0, current_timestamp).await?;
+        // user_list.retain(|entry| !self.ban_list.contains(&entry.user_id));
 
         let mut last_start_timestamp = current_timestamp;
 
@@ -188,60 +192,38 @@ impl BotBlock {
             let mut fetch_tasks = FuturesUnordered::new();
 
             for _ in 0..cmp::min(scan.iterations as usize, scan.concurrency) {
-                log::debug!("Fetching Data Block #{}", iteration);
-
                 let end_timestamp = last_start_timestamp;
                 let start_timestamp = end_timestamp - scan.period;
 
                 last_start_timestamp = start_timestamp;
 
-                let tx = tx.clone();
-                let client: BotBlock = client.clone();
+                fetch_tasks.push(client.fetch_user_activity_raw(
+                    start_timestamp,
+                    end_timestamp,
+                    scan.precision,
+                ));
 
-                let future = tokio::task::spawn(async move {
-                    let response = client
-                        .fetch_user_activity_raw(start_timestamp, end_timestamp, scan.precision)
-                        .await;
-
-                    tx.send(response).expect("Channel send failed");
-                });
-
-                fetch_tasks.push(future);
                 iteration += 1;
             }
 
-            while let Some(_) = fetch_tasks.next().await {
+            while let Some(response) = fetch_tasks.next().await {
+                tx.send(response).expect("Channel send failed");
+
                 if iteration >= scan.iterations {
                     break;
                 }
 
-                log::debug!("Fetching Data Block #{}", iteration);
-
                 let end_timestamp = last_start_timestamp;
                 let start_timestamp = end_timestamp - scan.period;
 
                 last_start_timestamp = start_timestamp;
 
-                let tx = tx.clone();
-                let client: BotBlock = client.clone();
+                fetch_tasks.push(client.fetch_user_activity_raw(
+                    start_timestamp,
+                    end_timestamp,
+                    scan.precision,
+                ));
 
-                let future = tokio::task::spawn(async move {
-                    let started_at = SystemTime::now();
-
-                    let response = client
-                        .fetch_user_activity_raw(start_timestamp, end_timestamp, scan.precision)
-                        .await;
-
-                    log::debug!(
-                        "Fetched Data Block #{} in {}ms",
-                        iteration,
-                        started_at.elapsed().unwrap().as_millis()
-                    );
-
-                    tx.send(response).expect("Channel send failed");
-                });
-
-                fetch_tasks.push(future);
                 iteration += 1;
             }
         });
@@ -260,28 +242,32 @@ impl BotBlock {
             .par_bridge()
             .map(|result| -> Result<(), Error> {
                 let started_at = SystemTime::now();
-
                 let (start_timestamp, end_timestamp, bytes) = result?;
-                let data: QueryResult<UserActivityData> = serde_json::from_slice(&bytes)?;
-                let data_size_raw = bytes.len();
 
+                let mut block_activity: QueryResult<UserActivityData> = serde_json::from_slice(&bytes)?;
+                let data_size_raw = bytes.len();
                 drop(bytes);
 
-                let user_activity = data.data;
+                let mut data_by_user_id: HashMap<String, UserActivity> = HashMap::new();
 
-                let mut data_by_user_id = user_list
-                    .iter()
-                    .map(|entry| {
-                        (
-                            entry.user_id.clone(),
-                            UserActivity::new(start_timestamp, end_timestamp, scan.precision),
-                        )
-                    })
-                    .collect::<std::collections::HashMap<String, UserActivity>>();
+                for entry in block_activity.data.drain(..) {
+                    if self.ban_list.contains(&entry.user_id) {
+                        continue;
+                    }
 
-                for entry in &user_activity {
-                    if let Some(activity) = data_by_user_id.get(&entry.user_id) {
-                        activity.append_sample(&entry);
+                    if let Some(user_activity) = data_by_user_id.get_mut(&entry.user_id) {
+                        user_activity.append_sample(entry);
+                    } else {
+                        let mut user_activity = UserActivity::new(
+                            start_timestamp,
+                            end_timestamp,
+                            scan.precision,
+                        );
+
+                        let user_id = entry.user_id.clone();
+                        user_activity.append_sample(entry);
+
+                        data_by_user_id.insert(user_id, user_activity);
                     }
                 }
 
@@ -433,32 +419,40 @@ impl BotBlock {
         Ok(response)
     }
 
-    async fn fetch_user_list(
-        &self,
-        start_timestamp: u64,
-        end_timestamp: u64,
-    ) -> Result<RecentUserList, Error> {
-        let query = format!(
-            "
-            SELECT
-                blob4 as user_id
-            FROM analytics_v0
-            WHERE timestamp >= toDateTime({}) AND timestamp <= toDateTime({})
-            GROUP BY user_id; FORMAT JSON
-        ",
-            start_timestamp, end_timestamp
-        );
+    // async fn fetch_user_list(
+    //     &self,
+    //     start_timestamp: u64,
+    //     end_timestamp: u64,
+    // ) -> Result<RecentUserList, Error> {
+    //     let query = format!(
+    //         "
+    //         SELECT
+    //             blob4 as user_id
+    //         FROM analytics_v0
+    //         WHERE timestamp >= toDateTime({}) AND timestamp <= toDateTime({})
+    //         GROUP BY user_id; FORMAT JSON
+    //     ",
+    //         start_timestamp, end_timestamp
+    //     );
 
-        let raw = self.query(query).await?;
-        Ok(raw.json::<QueryResult<RecentUserList>>().await?.data)
-    }
+    //     let raw = self.query(query).await?;
+    //     Ok(raw.json::<QueryResult<RecentUserList>>().await?.data)
+    // }
 
-    async fn fetch_user_activity_raw(
-        &self,
+    async fn fetch_user_activity_raw<'a>(
+        &'a self,
         start_timestamp: u64,
         end_timestamp: u64,
         precision: u64,
     ) -> Result<(u64, u64, Bytes), Error> {
+        let started_at = SystemTime::now();
+        log::debug!(
+            "Fetching User Activity Data: {} - {} (Precision: {})",
+            start_timestamp,
+            end_timestamp,
+            precision
+        );
+
         let query = format!(
             "
             SELECT
@@ -474,6 +468,17 @@ impl BotBlock {
         );
 
         let raw = self.query(query).await?;
+        log::debug!(
+            "Fetched User Activity Data: {} - {} (Precision: {}) ({}ms)",
+            start_timestamp,
+            end_timestamp,
+            precision,
+            SystemTime::now()
+                .duration_since(started_at)
+                .unwrap()
+                .as_millis()
+        );
+
         Ok((start_timestamp, end_timestamp, raw.bytes().await?))
     }
 }
@@ -483,12 +488,12 @@ pub struct QueryResult<T> {
     data: T,
 }
 
-pub type RecentUserList = Vec<RecentUserEntry>;
+// pub type RecentUserList = Vec<RecentUserEntry>;
 
-#[derive(Deserialize, Debug)]
-pub struct RecentUserEntry {
-    user_id: String,
-}
+// #[derive(Deserialize, Debug)]
+// pub struct RecentUserEntry {
+//     user_id: String,
+// }
 
 pub type UserActivityData = Vec<UserActivityEntry>;
 
@@ -511,10 +516,10 @@ struct UserActivityMeta {
 struct UserActivity {
     meta: Arc<UserActivityMeta>,
 
-    active_intervals: AtomicU64,
+    samples: Vec<UserActivityEntry>,
 
-    total_interactions: AtomicU64,
-    total_squared_interactions: AtomicU64,
+    total_interactions: u64,
+    total_squared_interactions: u64,
 }
 
 impl UserActivity {
@@ -527,29 +532,24 @@ impl UserActivity {
                 precision,
             }),
 
-            active_intervals: AtomicU64::new(0),
+            samples: Vec::new(),
 
-            total_interactions: AtomicU64::new(0),
-            total_squared_interactions: AtomicU64::new(0),
+            total_interactions: 0,
+            total_squared_interactions: 0,
         }
     }
 
-    pub fn append_sample(&self, entry: &UserActivityEntry) {
+    pub fn append_sample(&mut self, entry: UserActivityEntry) {
         let count = entry.interactions.parse::<u64>().unwrap();
 
-        self.total_interactions
-            .fetch_add(count, std::sync::atomic::Ordering::Release);
-        self.total_squared_interactions
-            .fetch_add(count * count, std::sync::atomic::Ordering::Release);
+        self.total_interactions += count;
+        self.total_squared_interactions += count.pow(2);
 
-        self.active_intervals
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        self.samples.push(entry);
     }
 
     pub fn time_active_ratio(&self) -> f64 {
-        let active_samples = self
-            .active_intervals
-            .load(std::sync::atomic::Ordering::Acquire) as f64;
+        let active_samples = self.samples.len() as f64;
 
         let total_intervals = (self.meta.end_timestamp - self.meta.start_timestamp) as f64
             / self.meta.precision as f64;
@@ -561,12 +561,8 @@ impl UserActivity {
         let total_intervals = (self.meta.end_timestamp - self.meta.start_timestamp) as f64
             / self.meta.precision as f64;
 
-        let total = self
-            .total_interactions
-            .load(std::sync::atomic::Ordering::Acquire) as f64;
-        let total_squared = self
-            .total_squared_interactions
-            .load(std::sync::atomic::Ordering::Acquire) as f64;
+        let total = self.total_interactions as f64;
+        let total_squared = self.total_squared_interactions as f64;
 
         let mean = total / total_intervals;
         let variance = total_squared / total_intervals - mean * mean;

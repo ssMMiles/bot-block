@@ -12,7 +12,7 @@ use std::{
     time::SystemTime,
 };
 
-use crate::discord::{DiscordWebhookMessage, GrafanaRender};
+use crate::discord::{send_discord_webhook, DiscordWebhookMessage, GrafanaRender};
 
 fn read_envvar(key: &str) -> String {
     match env::var(key) {
@@ -60,8 +60,7 @@ pub struct BotBlockBan {
     pub user_id: String,
 }
 
-#[derive(Clone)]
-pub struct BotBlock {
+pub struct BotBlockInner {
     cloudflare_uri: String,
     cloudflare_api_token: String,
 
@@ -74,6 +73,11 @@ pub struct BotBlock {
     pub discord_webhook_queue: crossbeam::channel::Sender<DiscordWebhookMessage>,
 
     pub ban_list: HashSet<String>,
+}
+
+#[derive(Clone)]
+pub struct BotBlock {
+    pub _inner: Arc<BotBlockInner>,
 }
 
 impl BotBlock {
@@ -123,32 +127,32 @@ impl BotBlock {
 
         let (tx, rx) = crossbeam::channel::unbounded::<DiscordWebhookMessage>();
         let botblock = BotBlock {
-            cloudflare_uri,
-            cloudflare_api_token,
+            _inner: Arc::new(BotBlockInner {
+                cloudflare_uri,
+                cloudflare_api_token,
 
-            grafana_uri_base,
-            grafana_api_token,
+                grafana_uri_base: grafana_uri_base.clone(),
+                grafana_api_token: grafana_api_token.clone(),
 
-            discord_webhook_url,
+                discord_webhook_url: discord_webhook_url.clone(),
 
-            http_client,
-            discord_webhook_queue: tx,
+                http_client,
+                discord_webhook_queue: tx,
 
-            ban_list,
+                ban_list,
+            }),
         };
 
-        let botblock_clone = botblock.clone();
         tokio::task::spawn(async move {
             let mut last_webhook_sent_at = SystemTime::now();
+            let http_client = reqwest::ClientBuilder::new()
+                .user_agent("BotBlock/1.0")
+                .http1_only()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap();
 
-            loop {
-                let botblock = botblock_clone.clone();
-
-                let message = match rx.recv() {
-                    Ok(message) => message,
-                    Err(_) => break,
-                };
-
+            while let Ok(message) = rx.recv() {
                 let elapsed = SystemTime::now()
                     .duration_since(last_webhook_sent_at)
                     .unwrap()
@@ -160,12 +164,20 @@ impl BotBlock {
 
                 last_webhook_sent_at = SystemTime::now();
 
-                if let Err(error) = botblock.send_webhook(message).await {
+                if let Err(error) = send_discord_webhook(
+                    http_client.clone(),
+                    &grafana_uri_base,
+                    &grafana_api_token,
+                    &discord_webhook_url,
+                    message,
+                )
+                .await
+                {
                     log::error!("Discord Webhook Error: {}", error);
                 }
             }
 
-            log::warn!("Discord Webhook Sender Task Exited");
+            log::debug!("Discord Webhook Sender Task Exited");
         });
 
         Ok(botblock)
@@ -186,8 +198,6 @@ impl BotBlock {
 
         let client = self.clone();
         tokio::spawn(async move {
-            let tx = tx.clone();
-
             let mut iteration = 0;
             let mut fetch_tasks = FuturesUnordered::new();
 
@@ -216,6 +226,7 @@ impl BotBlock {
                 }
 
                 if iteration >= scan.iterations {
+                    drop(tx);
                     break;
                 }
 
@@ -257,7 +268,7 @@ impl BotBlock {
                 let mut data_by_user_id: HashMap<String, UserActivity> = HashMap::new();
 
                 for entry in block_activity.data.drain(..) {
-                    if self.ban_list.contains(&entry.user_id) {
+                    if self._inner.ban_list.contains(&entry.user_id) {
                         continue;
                     }
 
@@ -331,7 +342,7 @@ impl BotBlock {
                                 user_id, active_ratio, dispersion_index, grafana_url
                             );
 
-                            self.discord_webhook_queue.send(DiscordWebhookMessage {
+                            self._inner.discord_webhook_queue.send(DiscordWebhookMessage {
                                 content: message,
                                 graph: Some(GrafanaRender {
                                     user_id: user_id.to_string(),
@@ -408,10 +419,11 @@ impl BotBlock {
         // log::debug!("Querying Cloudflare API: {}", query);
 
         let response = self
+            ._inner
             .http_client
-            .post(&self.cloudflare_uri)
+            .post(&self._inner.cloudflare_uri)
             .body(query)
-            .header("Authorization", &self.cloudflare_api_token)
+            .header("Authorization", &self._inner.cloudflare_api_token)
             .send()
             .await?;
 

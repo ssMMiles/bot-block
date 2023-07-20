@@ -10,8 +10,8 @@ mimalloc = ["dep:mimalloc"]
 concurrency = []
 
 [dependencies]
-reqwest = { version = "0.11", features = ["rustls-tls", "native-tls-alpn", "json", "multipart"] }
-sqlx = { version = "0.7.1", features = ["runtime-tokio", "tls-rustls", "sqlite"] }
+reqwest = { version = "0.11", features = ["rustls-tls", "json", "multipart"] }
+# sqlx = { version = "0.7.1", features = ["runtime-tokio", "tls-rustls", "sqlite"] }
 
 tokio = { version = "1", features = ["macros", "net", "time", "rt-multi-thread", "signal"] }
 futures = "0.3.28"

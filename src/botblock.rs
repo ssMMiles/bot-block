@@ -327,8 +327,8 @@ impl BotBlock {
                             );
 
                             let message = format!(
-                                "**User {}**\n**Activity Ratio**: {}\n**Dispersion Index**: {}",
-                                user_id, active_ratio, dispersion_index
+                                "**User {}**\n**Activity Ratio**: {}\n**Dispersion Index**: {}\n\n**[View In Grafana]({})**",
+                                user_id, active_ratio, dispersion_index, grafana_url
                             );
 
                             self.discord_webhook_queue.send(DiscordWebhookMessage {

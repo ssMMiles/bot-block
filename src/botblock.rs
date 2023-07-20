@@ -207,7 +207,13 @@ impl BotBlock {
             }
 
             while let Some(response) = fetch_tasks.next().await {
-                tx.send(response).expect("Channel send failed");
+                match tx.send(response) {
+                    Ok(_) => {}
+                    Err(err) => {
+                        log::warn!("Failed to send response to processing pool: {}", err);
+                        break;
+                    }
+                }
 
                 if iteration >= scan.iterations {
                     break;

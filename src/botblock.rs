@@ -32,6 +32,9 @@ pub enum Error {
 
     #[error("Failed to parse config file: {0}")]
     ConfigParseError(#[from] toml::de::Error),
+
+    #[error("User activity contains invalid date: {0}")]
+    InvalidDateError(#[from] chrono::ParseError),
 }
 
 pub struct ActivityScan {
@@ -48,6 +51,7 @@ pub struct ActivityScan {
 pub struct ActivityScanCheck {
     pub active_ratio_threshold: Option<f64>,
     pub dispersion_index_threshold: Option<f64>,
+    pub delta_dispersion_index_threshold: Option<f64>,
 }
 
 #[derive(Deserialize)]
@@ -55,29 +59,18 @@ pub struct BotBlockBan {
     pub user_id: String,
 }
 
-pub struct BotBlockInner {
-    cloudflare_uri: String,
-    cloudflare_api_token: String,
-
-    pub grafana_uri_base: String,
-    pub grafana_api_token: String,
-
-    pub discord_webhook_uri: String,
-
-    pub http_client: reqwest::Client,
-    pub discord_webhook_queue: crossbeam::channel::Sender<DiscordWebhookMessage>,
-
-    pub ban_list: HashSet<String>,
-}
-
 #[derive(Clone)]
 pub struct BotBlock {
-    pub _inner: Arc<BotBlockInner>,
+    config: Arc<BotBlockConfig>,
+    ban_list: Arc<HashSet<String>>,
+
+    http_client: reqwest::Client,
+    discord_webhook_queue: crossbeam::channel::Sender<DiscordWebhookMessage>,
 }
 
 #[derive(Deserialize)]
 pub struct BotBlockConfig {
-    pub cloudflare_account_id: String,
+    pub cloudflare_analytics_uri: String,
     pub cloudflare_api_token: String,
 
     pub grafana_uri_base: String,
@@ -90,9 +83,9 @@ pub struct BotBlockConfig {
 
 impl BotBlock {
     pub async fn new() -> Result<Self, Error> {
-        let config: BotBlockConfig = toml::from_str(&std::fs::read_to_string(
+        let config: Arc<BotBlockConfig> = Arc::new(toml::from_str(&std::fs::read_to_string(
             env::var("BOTBLOCK_CONFIG").unwrap_or_else(|_| "botblock.toml".to_string()),
-        )?)?;
+        )?)?);
 
         let http_client = reqwest::ClientBuilder::new()
             .user_agent("BotBlock/1.0")
@@ -100,9 +93,32 @@ impl BotBlock {
             .timeout(std::time::Duration::from_secs(10))
             .build()?;
 
+        let discord_webhook_queue = Self::start_discord_webhook_task(
+            http_client.clone(),
+            config.grafana_uri_base.clone(),
+            config.grafana_api_token.clone(),
+            config.discord_webhook_uri.clone(),
+        );
+
+        let ban_list =
+            Arc::new(Self::fetch_ban_list(http_client.clone(), &config.botblock_api_token).await?);
+
+        Ok(BotBlock {
+            http_client,
+            discord_webhook_queue,
+
+            config,
+            ban_list,
+        })
+    }
+
+    async fn fetch_ban_list(
+        http_client: reqwest::Client,
+        botblock_api_token: &str,
+    ) -> Result<HashSet<String>, Error> {
         let ban_list_response = http_client
             .get("https://botblock.limbolabs.gg/api/bans")
-            .header("Authorization", config.botblock_api_token)
+            .header("Authorization", botblock_api_token)
             .send()
             .await?;
 
@@ -113,44 +129,24 @@ impl BotBlock {
             return Err(Error::BotBlockApiError(status, body));
         }
 
-        let ban_list = ban_list_response
+        Ok(ban_list_response
             .json::<Vec<BotBlockBan>>()
             .await?
             .into_iter()
             .map(|ban| ban.user_id)
-            .collect::<HashSet<String>>();
+            .collect::<HashSet<String>>())
+    }
 
-        log::debug!("Found {} Users In Existing Ban List", ban_list.len());
-
+    fn start_discord_webhook_task(
+        http_client: reqwest::Client,
+        grafana_uri_base: String,
+        grafana_api_token: String,
+        discord_webhook_uri: String,
+    ) -> crossbeam::channel::Sender<DiscordWebhookMessage> {
         let (tx, rx) = crossbeam::channel::unbounded::<DiscordWebhookMessage>();
-        let botblock = BotBlock {
-            _inner: Arc::new(BotBlockInner {
-                cloudflare_uri: format!(
-                    "https://api.cloudflare.com/client/v4/accounts/{}/analytics_engine/sql",
-                    config.cloudflare_account_id
-                ),
-                cloudflare_api_token: config.cloudflare_api_token,
-
-                grafana_uri_base: config.grafana_uri_base.clone(),
-                grafana_api_token: config.grafana_api_token.clone(),
-
-                discord_webhook_uri: config.discord_webhook_uri.clone(),
-
-                http_client,
-                discord_webhook_queue: tx,
-
-                ban_list,
-            }),
-        };
 
         tokio::task::spawn(async move {
             let mut last_webhook_sent_at = SystemTime::now();
-            let http_client = reqwest::ClientBuilder::new()
-                .user_agent("BotBlock/1.0")
-                .http1_only()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-                .unwrap();
 
             while let Ok(message) = rx.recv() {
                 let elapsed = SystemTime::now()
@@ -166,9 +162,9 @@ impl BotBlock {
 
                 if let Err(error) = send_discord_webhook(
                     http_client.clone(),
-                    &config.grafana_uri_base,
-                    &config.grafana_api_token,
-                    &config.discord_webhook_uri,
+                    &grafana_uri_base,
+                    &grafana_api_token,
+                    &discord_webhook_uri,
                     message,
                 )
                 .await
@@ -180,7 +176,7 @@ impl BotBlock {
             log::debug!("Discord Webhook Sender Task Exited");
         });
 
-        Ok(botblock)
+        tx
     }
 
     pub async fn scan_recent_player_activity(&self, scan: ActivityScan) -> Result<(), Error> {
@@ -190,7 +186,7 @@ impl BotBlock {
             .as_secs();
 
         // let mut user_list = self.fetch_user_list(0, current_timestamp).await?;
-        // user_list.retain(|entry| !self.ban_list.contains(&entry.user_id));
+        // user_list.retain(|entry| !self.ban_list.contains(&entry.user_id));F
 
         let mut last_start_timestamp = current_timestamp;
 
@@ -201,19 +197,23 @@ impl BotBlock {
             let mut iteration = 0;
             let mut fetch_tasks = FuturesUnordered::new();
 
-            for _ in 0..cmp::min(scan.iterations as usize, scan.concurrency) {
+            let mut start_fetcher = |iteration: &mut u64| {
                 let end_timestamp = last_start_timestamp;
                 let start_timestamp = end_timestamp - scan.period;
 
                 last_start_timestamp = start_timestamp;
 
-                fetch_tasks.push(client.fetch_user_activity_raw(
+                *iteration += 1;
+
+                return client.fetch_user_activity_raw(
                     start_timestamp,
                     end_timestamp,
                     scan.precision,
-                ));
+                );
+            };
 
-                iteration += 1;
+            for _ in 0..cmp::min(scan.iterations as usize, scan.concurrency) {
+                fetch_tasks.push(start_fetcher(&mut iteration));
             }
 
             while let Some(response) = fetch_tasks.next().await {
@@ -230,18 +230,7 @@ impl BotBlock {
                     break;
                 }
 
-                let end_timestamp = last_start_timestamp;
-                let start_timestamp = end_timestamp - scan.period;
-
-                last_start_timestamp = start_timestamp;
-
-                fetch_tasks.push(client.fetch_user_activity_raw(
-                    start_timestamp,
-                    end_timestamp,
-                    scan.precision,
-                ));
-
-                iteration += 1;
+                fetch_tasks.push(start_fetcher(&mut iteration));
             }
         });
 
@@ -254,6 +243,11 @@ impl BotBlock {
         let total_standard_deviation = AtomicU64::new(0);
 
         let total_user_samples = AtomicU64::new(0);
+
+        let total_interaction_delta = AtomicU64::new(0);
+        let total_interaction_delta_dispersion = AtomicU64::new(0);
+
+        let user_block_count = AtomicU64::new(0);
 
         rx.into_iter()
             .par_bridge()
@@ -268,12 +262,12 @@ impl BotBlock {
                 let mut data_by_user_id: HashMap<String, UserActivity> = HashMap::new();
 
                 for entry in block_activity.data.drain(..) {
-                    if self._inner.ban_list.contains(&entry.user_id) {
+                    if !self.ban_list.contains(&entry.user_id) {
                         continue;
                     }
 
                     if let Some(user_activity) = data_by_user_id.get_mut(&entry.user_id) {
-                        user_activity.append_sample(entry);
+                        user_activity.append_sample(entry)?;
                     } else {
                         let mut user_activity = UserActivity::new(
                             start_timestamp,
@@ -282,7 +276,7 @@ impl BotBlock {
                         );
 
                         let user_id = entry.user_id.clone();
-                        user_activity.append_sample(entry);
+                        user_activity.append_sample(entry)?;
 
                         data_by_user_id.insert(user_id, user_activity);
                     }
@@ -296,10 +290,13 @@ impl BotBlock {
                     total_user_samples.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let active_ratio = activity.time_active_ratio();
 
-                    let (mean, variance) = activity.mean_and_variance();
+                    let (mean, variance) = activity.activity_level_mean_and_variance();
                     let dispersion_index = variance as f64 / mean as f64;
 
                     let standard_deviation = variance.sqrt();
+
+                    let (delta_mean, delta_variance) =
+                        activity.interaction_delta_mean_and_variance();
 
                     total_active_ratio.fetch_add(
                         (active_ratio * FLOAT_PRECISION_FACTOR as f64) as u64
@@ -318,23 +315,51 @@ impl BotBlock {
                         std::sync::atomic::Ordering::Relaxed,
                     );
 
+                    total_interaction_delta.fetch_add(
+                        delta_mean as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+
+                    total_interaction_delta_dispersion.fetch_add(
+                        (delta_variance * FLOAT_PRECISION_FACTOR as f64) as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+
+                    user_block_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
                     for check in &scan.checks {
                         let user_id = user_id.clone();
 
-                        let is_over_active_threshold =
-                            active_ratio >= check.active_ratio_threshold.unwrap_or(f64::MIN);
-                        let is_below_dispersion_threshold = dispersion_index
-                            <= check.dispersion_index_threshold.unwrap_or(f64::MAX);
+                        let is_over_active_threshold = if check.active_ratio_threshold.is_none() {
+                            true
+                        } else {
+                            active_ratio >= check.active_ratio_threshold.unwrap_or(f64::MIN)
+                        };
 
-                        if is_over_active_threshold & is_below_dispersion_threshold {
+                        let is_below_dispersion_threshold = if check.dispersion_index_threshold.is_none() {
+                            true
+                        } else {
+                            dispersion_index
+                                <= check.dispersion_index_threshold.unwrap_or(f64::MAX)
+                        };
+
+                        let is_below_delta_dispersion_threshold = if check.delta_dispersion_index_threshold.is_none() {
+                            true
+                        } else {
+                            delta_variance
+                                <= check.delta_dispersion_index_threshold.unwrap_or(f64::MAX)
+                        };
+
+                        if is_over_active_threshold & is_below_dispersion_threshold & is_below_delta_dispersion_threshold {
                             let grafana_url = format!("https://limbolabs.grafana.net/d/RL9sMaS4z/cloudflare-analytics?orgId=1&from={}000&to={}000&var-targetUser={}&viewPanel=5",
                                 start_timestamp, end_timestamp, user_id);
                             log::info!(
-                                "User {} ({}) - Active Ratio: {} - Dispersion Index: {}",
+                                "User {} ({}) - Active Ratio: {} - Dispersion Index: {} - Delta Dispersion Index: {}",
                                 user_id,
                                 hyperlink(&grafana_url, "View In Grafana"),
                                 active_ratio,
-                                dispersion_index
+                                dispersion_index,
+                                delta_variance
                             );
 
                             let message = format!(
@@ -342,7 +367,7 @@ impl BotBlock {
                                 user_id, active_ratio, dispersion_index, grafana_url
                             );
 
-                            self._inner.discord_webhook_queue.send(DiscordWebhookMessage {
+                            self.discord_webhook_queue.send(DiscordWebhookMessage {
                                 content: message,
                                 graph: Some(GrafanaRender {
                                     user_id: user_id.to_string(),
@@ -396,7 +421,17 @@ impl BotBlock {
         let average_standard_deviation =
             total_standard_deviation.load(std::sync::atomic::Ordering::SeqCst) / user_sample_count;
 
-        log::debug!(
+        let user_block_count = user_block_count.load(std::sync::atomic::Ordering::SeqCst);
+
+        let average_interaction_delta_mean =
+            total_interaction_delta.load(std::sync::atomic::Ordering::SeqCst) / user_block_count;
+
+        let average_interaction_delta_dispersion =
+            (total_interaction_delta_dispersion.load(std::sync::atomic::Ordering::SeqCst) as f64
+                / FLOAT_PRECISION_FACTOR as f64)
+                / user_block_count as f64;
+
+        log::info!(
             "Scanned total of {} seconds, {}x {}s blocks with {} second precision. Average block processing duration: {}ms",
             scan.period * scan.iterations,
             scan.iterations,
@@ -405,11 +440,13 @@ impl BotBlock {
             average_scan_duration
         );
 
-        log::debug!(
-            "Average Active Ratio: {} - Average Dispersion Index: {} - Average Standard Deviation: {}",
+        log::info!(
+            "Average Active Ratio: {} - Average Dispersion Index: {} - Average Standard Deviation: {} - Average Interaction Delta Mean: {} - Average Interaction Delta Dispersion: {}",
             average_active_ratio,
             average_dispersion_index,
-            average_standard_deviation
+            average_standard_deviation,
+            average_interaction_delta_mean,
+            average_interaction_delta_dispersion
         );
 
         Ok(())
@@ -419,13 +456,12 @@ impl BotBlock {
         // log::debug!("Querying Cloudflare API: {}", query);
 
         let response = self
-            ._inner
             .http_client
-            .post(&self._inner.cloudflare_uri)
+            .post(&self.config.cloudflare_analytics_uri)
             .body(query)
             .header(
                 "Authorization",
-                format!("Bearer {}", &self._inner.cloudflare_api_token),
+                format!("Bearer {}", &self.config.cloudflare_api_token),
             )
             .send()
             .await?;
@@ -460,8 +496,8 @@ impl BotBlock {
     //     Ok(raw.json::<QueryResult<RecentUserList>>().await?.data)
     // }
 
-    async fn fetch_user_activity_raw<'a>(
-        &'a self,
+    async fn fetch_user_activity_raw(
+        &self,
         start_timestamp: u64,
         end_timestamp: u64,
         precision: u64,
@@ -522,7 +558,7 @@ pub type UserActivityData = Vec<UserActivityEntry>;
 pub struct UserActivityEntry {
     user_id: String,
     interactions: String,
-    // interval_start: String,
+    interval_start: String,
 }
 
 #[derive(Debug)]
@@ -541,6 +577,11 @@ struct UserActivity {
 
     total_interactions: u64,
     total_squared_interactions: u64,
+
+    last_interaction_at: Option<u64>,
+
+    total_interaction_delta: u64,
+    total_squared_interaction_delta: u64,
 }
 
 impl UserActivity {
@@ -557,16 +598,35 @@ impl UserActivity {
 
             total_interactions: 0,
             total_squared_interactions: 0,
+
+            last_interaction_at: None,
+
+            total_interaction_delta: 0,
+            total_squared_interaction_delta: 0,
         }
     }
 
-    pub fn append_sample(&mut self, entry: UserActivityEntry) {
+    pub fn append_sample(&mut self, entry: UserActivityEntry) -> Result<(), Error> {
         let count = entry.interactions.parse::<u64>().unwrap();
 
         self.total_interactions += count;
         self.total_squared_interactions += count.pow(2);
 
+        let timestamp =
+            chrono::NaiveDateTime::parse_from_str(&entry.interval_start, "%Y-%m-%d %H:%M:%S")?
+                .timestamp() as u64;
+
+        if let Some(last_interaction_at) = self.last_interaction_at {
+            let delta = (last_interaction_at - timestamp) / self.meta.precision;
+
+            self.total_interaction_delta += delta;
+            self.total_squared_interaction_delta += delta.pow(2);
+        }
+
+        self.last_interaction_at = Some(timestamp);
         self.samples.push(entry);
+
+        Ok(())
     }
 
     pub fn time_active_ratio(&self) -> f64 {
@@ -578,7 +638,7 @@ impl UserActivity {
         active_samples / total_intervals
     }
 
-    pub fn mean_and_variance(&self) -> (f64, f64) {
+    pub fn activity_level_mean_and_variance(&self) -> (f64, f64) {
         let total_intervals = (self.meta.end_timestamp - self.meta.start_timestamp) as f64
             / self.meta.precision as f64;
 
@@ -587,6 +647,18 @@ impl UserActivity {
 
         let mean = total / total_intervals;
         let variance = total_squared / total_intervals - mean * mean;
+
+        (mean, variance)
+    }
+
+    pub fn interaction_delta_mean_and_variance(&self) -> (f64, f64) {
+        let active_samples = self.samples.len() as f64;
+
+        let total = self.total_interaction_delta as f64;
+        let total_squared = self.total_squared_interaction_delta as f64;
+
+        let mean = total / active_samples;
+        let variance = total_squared / active_samples - mean * mean;
 
         (mean, variance)
     }

@@ -9,6 +9,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 
 mod botblock;
 mod discord;
+mod fetcher;
 
 #[tokio::main]
 async fn main() {
@@ -41,6 +42,7 @@ async fn main() {
             checks: vec![ActivityScanCheck {
                 active_ratio_threshold: Some(0.05),
                 dispersion_index_threshold: Some(2.0),
+                delta_dispersion_index_threshold: None,
             }],
         },
         ActivityScan {
@@ -55,6 +57,7 @@ async fn main() {
             checks: vec![ActivityScanCheck {
                 active_ratio_threshold: Some(0.002),
                 dispersion_index_threshold: Some(0.8),
+                delta_dispersion_index_threshold: None,
             }],
         },
         ActivityScan {
@@ -69,6 +72,7 @@ async fn main() {
             checks: vec![ActivityScanCheck {
                 active_ratio_threshold: Some(0.8),
                 dispersion_index_threshold: None,
+                delta_dispersion_index_threshold: None,
             }],
         },
         ActivityScan {
@@ -83,6 +87,7 @@ async fn main() {
             checks: vec![ActivityScanCheck {
                 active_ratio_threshold: Some(0.9),
                 dispersion_index_threshold: None,
+                delta_dispersion_index_threshold: None,
             }],
         },
     ];

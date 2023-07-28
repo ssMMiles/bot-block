@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use futures::{stream::FuturesUnordered, StreamExt};
+use futures::{future::BoxFuture, stream::FuturesUnordered, StreamExt};
 use rayon::prelude::{ParallelBridge, ParallelIterator};
 use reqwest::Response;
 use serde::Deserialize;
@@ -11,7 +11,10 @@ use std::{
     time::SystemTime,
 };
 
-use crate::discord::{send_discord_webhook, DiscordWebhookMessage, GrafanaRender};
+use crate::{
+    discord::{send_discord_webhook, DiscordWebhookMessage, GrafanaRender},
+    fetcher::start_fetcher_task,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -179,60 +182,34 @@ impl BotBlock {
         tx
     }
 
-    pub async fn scan_recent_player_activity(&self, scan: ActivityScan) -> Result<(), Error> {
+    pub async fn scan_recent_player_activity(
+        &'static self,
+        scan: ActivityScan,
+    ) -> Result<(), Error> {
         let current_timestamp = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
             .as_secs();
 
-        // let mut user_list = self.fetch_user_list(0, current_timestamp).await?;
-        // user_list.retain(|entry| !self.ban_list.contains(&entry.user_id));F
+        let fetcher = move |iteration, state: BotBlock| {
+            let offset = iteration as u64 * scan.period;
 
-        let mut last_start_timestamp = current_timestamp;
+            let end_timestamp = current_timestamp - offset;
+            let start_timestamp = end_timestamp - scan.period;
 
-        let (tx, rx) = crossbeam::channel::unbounded();
+            let future =
+                state.fetch_user_activity_raw(start_timestamp, end_timestamp, scan.precision);
 
-        let client = self.clone();
-        tokio::spawn(async move {
-            let mut iteration = 0;
-            let mut fetch_tasks = FuturesUnordered::new();
+            return Box::pin(future) as BoxFuture<'static, Result<(u64, u64, Bytes), Error>>;
+        };
 
-            let mut start_fetcher = |iteration: &mut u64| {
-                let end_timestamp = last_start_timestamp;
-                let start_timestamp = end_timestamp - scan.period;
-
-                last_start_timestamp = start_timestamp;
-
-                *iteration += 1;
-
-                return client.fetch_user_activity_raw(
-                    start_timestamp,
-                    end_timestamp,
-                    scan.precision,
-                );
-            };
-
-            for _ in 0..cmp::min(scan.iterations as usize, scan.concurrency) {
-                fetch_tasks.push(start_fetcher(&mut iteration));
-            }
-
-            while let Some(response) = fetch_tasks.next().await {
-                match tx.send(response) {
-                    Ok(_) => {}
-                    Err(err) => {
-                        log::warn!("Failed to send response to processing pool: {}", err);
-                        break;
-                    }
-                }
-
-                if iteration >= scan.iterations {
-                    drop(tx);
-                    break;
-                }
-
-                fetch_tasks.push(start_fetcher(&mut iteration));
-            }
-        });
+        let receiver = start_fetcher_task::<Result<(u64, u64, Bytes), Error>, BotBlock>(
+            scan.iterations as usize,
+            scan.concurrency,
+            fetcher,
+            self.clone(),
+        )
+        .await;
 
         let total_scan_duration = AtomicU64::new(0);
 
@@ -249,7 +226,7 @@ impl BotBlock {
 
         let user_block_count = AtomicU64::new(0);
 
-        rx.into_iter()
+        receiver.into_iter()
             .par_bridge()
             .map(|result| -> Result<(), Error> {
                 let started_at = SystemTime::now();

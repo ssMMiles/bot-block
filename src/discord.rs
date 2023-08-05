@@ -24,24 +24,31 @@ fn get_grafana_query_details(details: GrafanaRender) -> String {
 
 pub async fn send_discord_webhook(
     http_client: reqwest::Client,
-    grafana_uri_base: &str,
+    grafana_uri_base_render: &str,
     grafana_api_token: &str,
     webhook_url: &str,
     message: DiscordWebhookMessage,
 ) -> Result<(), reqwest::Error> {
     let response: Response;
     if let Some(details) = message.graph {
-        let image = http_client
-            .get(format!(
-                "{}{}",
-                grafana_uri_base,
-                get_grafana_query_details(details)
-            ))
-            .header("Authorization", grafana_api_token)
+        let image_url = format!(
+            "{}{}",
+            grafana_uri_base_render,
+            get_grafana_query_details(details)
+        );
+
+        let image_response = http_client
+            .get(image_url)
+            .header("Authorization", format!("Bearer {}", grafana_api_token))
             .send()
-            .await?
-            .bytes()
-            .await?;
+            .await;
+
+        if let Err(err) = image_response {
+            log::error!("Failed to fetch image: {}", err);
+            return Ok(());
+        }
+
+        let data = image_response?.bytes().await?;
 
         let message_data = json!({
             "embeds": [
@@ -62,7 +69,7 @@ pub async fn send_discord_webhook(
             .text("payload_json", message_data.to_string())
             .part(
                 "files[0]",
-                reqwest::multipart::Part::bytes(image.to_vec())
+                reqwest::multipart::Part::bytes(data.to_vec())
                     .file_name("graph.png")
                     .headers(headers),
             );

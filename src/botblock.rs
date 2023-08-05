@@ -74,6 +74,8 @@ pub struct BotBlockConfig {
     pub cloudflare_api_token: String,
 
     pub grafana_uri_base: String,
+    pub grafana_uri_base_render: String,
+
     pub grafana_api_token: String,
 
     pub discord_webhook_uri: String,
@@ -95,7 +97,7 @@ impl BotBlock {
 
         let discord_webhook_queue = Self::start_discord_webhook_task(
             http_client.clone(),
-            config.grafana_uri_base.clone(),
+            config.grafana_uri_base_render.clone(),
             config.grafana_api_token.clone(),
             config.discord_webhook_uri.clone(),
         );
@@ -139,7 +141,7 @@ impl BotBlock {
 
     fn start_discord_webhook_task(
         http_client: reqwest::Client,
-        grafana_uri_base: String,
+        grafana_uri_base_render: String,
         grafana_api_token: String,
         discord_webhook_uri: String,
     ) -> crossbeam::channel::Sender<DiscordWebhookMessage> {
@@ -162,7 +164,7 @@ impl BotBlock {
 
                 if let Err(error) = send_discord_webhook(
                     http_client.clone(),
-                    &grafana_uri_base,
+                    &grafana_uri_base_render,
                     &grafana_api_token,
                     &discord_webhook_uri,
                     message,
@@ -236,7 +238,7 @@ impl BotBlock {
 
         let total_scan_duration = AtomicU64::new(0);
 
-        const FLOAT_PRECISION_FACTOR: u64 = 1000000;
+        const FLOAT_PRECISION_FACTOR: f64 = 1000000.0;
 
         let total_active_ratio = AtomicU64::new(0);
         let total_dispersion_index = AtomicU64::new(0);
@@ -299,19 +301,16 @@ impl BotBlock {
                         activity.interaction_delta_mean_and_variance();
 
                     total_active_ratio.fetch_add(
-                        (active_ratio * FLOAT_PRECISION_FACTOR as f64) as u64
-                            / FLOAT_PRECISION_FACTOR,
+                        (active_ratio * FLOAT_PRECISION_FACTOR) as u64,
                         std::sync::atomic::Ordering::Relaxed,
                     );
                     total_dispersion_index.fetch_add(
-                        (dispersion_index * FLOAT_PRECISION_FACTOR as f64) as u64
-                            / FLOAT_PRECISION_FACTOR,
+                        (dispersion_index * FLOAT_PRECISION_FACTOR) as u64,
                         std::sync::atomic::Ordering::Relaxed,
                     );
 
                     total_standard_deviation.fetch_add(
-                        (standard_deviation * FLOAT_PRECISION_FACTOR as f64) as u64
-                            / FLOAT_PRECISION_FACTOR,
+                        (standard_deviation * FLOAT_PRECISION_FACTOR) as u64,
                         std::sync::atomic::Ordering::Relaxed,
                     );
 
@@ -321,7 +320,7 @@ impl BotBlock {
                     );
 
                     total_interaction_delta_dispersion.fetch_add(
-                        (delta_variance * FLOAT_PRECISION_FACTOR as f64) as u64,
+                        (delta_variance * FLOAT_PRECISION_FACTOR) as u64,
                         std::sync::atomic::Ordering::Relaxed,
                     );
 
@@ -330,29 +329,13 @@ impl BotBlock {
                     for check in &scan.checks {
                         let user_id = user_id.clone();
 
-                        let is_over_active_threshold = if check.active_ratio_threshold.is_none() {
-                            true
-                        } else {
-                            active_ratio >= check.active_ratio_threshold.unwrap_or(f64::MIN)
-                        };
+                        let is_over_active_threshold = check.active_ratio_threshold.is_none() || active_ratio >= check.active_ratio_threshold.unwrap_or(f64::MIN); 
+                        let is_below_dispersion_threshold = check.dispersion_index_threshold.is_none() || dispersion_index <= check.dispersion_index_threshold.unwrap_or(f64::MAX);
 
-                        let is_below_dispersion_threshold = if check.dispersion_index_threshold.is_none() {
-                            true
-                        } else {
-                            dispersion_index
-                                <= check.dispersion_index_threshold.unwrap_or(f64::MAX)
-                        };
-
-                        let is_below_delta_dispersion_threshold = if check.delta_dispersion_index_threshold.is_none() {
-                            true
-                        } else {
-                            delta_variance
-                                <= check.delta_dispersion_index_threshold.unwrap_or(f64::MAX)
-                        };
+                        let is_below_delta_dispersion_threshold = check.delta_dispersion_index_threshold.is_none() || delta_variance <= check.delta_dispersion_index_threshold.unwrap_or(f64::MAX);
 
                         if is_over_active_threshold & is_below_dispersion_threshold & is_below_delta_dispersion_threshold {
-                            let grafana_url = format!("https://limbolabs.grafana.net/d/RL9sMaS4z/cloudflare-analytics?orgId=1&from={}000&to={}000&var-targetUser={}&viewPanel=5",
-                                start_timestamp, end_timestamp, user_id);
+                            let grafana_url = format!("{}&from={}000&to={}000&var-targetUser={}", self.config.grafana_uri_base, start_timestamp, end_timestamp, user_id);
                             log::info!(
                                 "User {} ({}) - Active Ratio: {} - Dispersion Index: {} - Delta Dispersion Index: {}",
                                 user_id,
@@ -413,18 +396,31 @@ impl BotBlock {
 
         let user_sample_count = total_user_samples.load(std::sync::atomic::Ordering::SeqCst);
 
-        let average_active_ratio =
-            total_active_ratio.load(std::sync::atomic::Ordering::SeqCst) / user_sample_count;
+        if user_sample_count == 0 {
+            log::debug!("No User Samples Found");
+            return Ok(());
+        }
+
+        let average_active_ratio = (total_active_ratio.load(std::sync::atomic::Ordering::SeqCst)
+            as f64
+            / FLOAT_PRECISION_FACTOR)
+            / user_sample_count as f64;
         let average_dispersion_index =
-            total_dispersion_index.load(std::sync::atomic::Ordering::SeqCst) / user_sample_count;
+            (total_dispersion_index.load(std::sync::atomic::Ordering::SeqCst) as f64
+                / FLOAT_PRECISION_FACTOR)
+                / user_sample_count as f64;
 
         let average_standard_deviation =
-            total_standard_deviation.load(std::sync::atomic::Ordering::SeqCst) / user_sample_count;
+            (total_standard_deviation.load(std::sync::atomic::Ordering::SeqCst) as f64
+                / FLOAT_PRECISION_FACTOR)
+                / user_sample_count as f64;
 
         let user_block_count = user_block_count.load(std::sync::atomic::Ordering::SeqCst);
 
         let average_interaction_delta_mean =
-            total_interaction_delta.load(std::sync::atomic::Ordering::SeqCst) / user_block_count;
+            (total_interaction_delta.load(std::sync::atomic::Ordering::SeqCst) as f64
+                / FLOAT_PRECISION_FACTOR)
+                / user_block_count as f64;
 
         let average_interaction_delta_dispersion =
             (total_interaction_delta_dispersion.load(std::sync::atomic::Ordering::SeqCst) as f64

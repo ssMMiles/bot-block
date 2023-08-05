@@ -35,12 +35,13 @@ async fn main() {
             period: 60 * 60 * 24,
             precision: 15,
 
-            iterations: 1,
+            iterations: 4,
             concurrency: 4,
 
             checks: vec![ActivityScanCheck {
                 active_ratio_threshold: Some(0.05),
                 dispersion_index_threshold: Some(2.0),
+                delta_dispersion_index_threshold: None,
             }],
         },
         ActivityScan {
@@ -49,12 +50,13 @@ async fn main() {
             period: 60 * 60,
             precision: 1,
 
-            iterations: 1,
+            iterations: 4,
             concurrency: 4,
 
             checks: vec![ActivityScanCheck {
                 active_ratio_threshold: Some(0.002),
                 dispersion_index_threshold: Some(0.8),
+                delta_dispersion_index_threshold: None,
             }],
         },
         ActivityScan {
@@ -63,12 +65,13 @@ async fn main() {
             period: 60 * 60 * 12,
             precision: 60 * 3,
 
-            iterations: 1,
+            iterations: 4,
             concurrency: 4,
 
             checks: vec![ActivityScanCheck {
                 active_ratio_threshold: Some(0.8),
                 dispersion_index_threshold: None,
+                delta_dispersion_index_threshold: None,
             }],
         },
         ActivityScan {
@@ -77,12 +80,13 @@ async fn main() {
             period: 60 * 60 * 24,
             precision: 60 * 20,
 
-            iterations: 1,
+            iterations: 4,
             concurrency: 4,
 
             checks: vec![ActivityScanCheck {
                 active_ratio_threshold: Some(0.9),
                 dispersion_index_threshold: None,
+                delta_dispersion_index_threshold: None,
             }],
         },
     ];

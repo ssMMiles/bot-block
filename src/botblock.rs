@@ -187,9 +187,6 @@ impl BotBlock {
             .unwrap()
             .as_secs();
 
-        // let mut user_list = self.fetch_user_list(0, current_timestamp).await?;
-        // user_list.retain(|entry| !self.ban_list.contains(&entry.user_id));F
-
         let mut last_start_timestamp = current_timestamp;
 
         let (tx, rx) = crossbeam::channel::unbounded();
@@ -264,7 +261,7 @@ impl BotBlock {
                 let mut data_by_user_id: HashMap<String, UserActivity> = HashMap::new();
 
                 for entry in block_activity.data.drain(..) {
-                    if !self.ban_list.contains(&entry.user_id) {
+                    if self.ban_list.contains(&entry.user_id) {
                         continue;
                     }
 
